@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 )
 
 // LoggingMiddleware logs method calls, parameters, results, and elapsed time.

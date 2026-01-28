@@ -8,26 +8,37 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
+
 	stdopentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
+	"github.com/openzipkin/zipkin-go"
+	httpreporter "github.com/openzipkin/zipkin-go/reporter/http"
 
 	"net"
 	"net/http"
 
 	"path/filepath"
 
+	"context"
+
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
-	"github.com/microservices-demo/catalogue"
+	"github.com/mikesay/catalogue"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/middleware"
-	"golang.org/x/net/context"
 )
 
 const (
 	ServiceName = "catalogue"
 )
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 var (
 	HTTPLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -35,6 +46,24 @@ var (
 		Help:    "Time (in seconds) spent serving HTTP requests.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "path", "status_code", "isWS"})
+
+	HTTPRequestActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "http_request_active",
+		Help: "The number of HTTP requests currently being handled.",
+	}, []string{"method", "path"})
+
+	HTTPRequestSizeBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "http_request_size_bytes",
+		Help: "Size of HTTP request bodies in bytes.",
+		// Exponential buckets are better for sizes (e.g., 100B to 10MB).
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6),
+	}, []string{"method", "handler"})
+
+	HTTPResponseSizeBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_response_size_bytes",
+		Help:    "Size of HTTP response bodies in bytes.",
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6),
+	}, []string{"method", "handler"})
 )
 
 func init() {
@@ -43,7 +72,7 @@ func init() {
 
 func main() {
 	var (
-		port   = flag.String("port", "80", "Port to bind HTTP listener") // TODO(pb): should be -addr, default ":80"
+		port   = flag.String("port", env("PORT", "80"), "Port to bind HTTP listener") // TODO(pb): should be -addr, default ":80"
 		images = flag.String("images", "./images/", "Image path")
 		dsn    = flag.String("DSN", "catalogue_user:default_password@tcp(catalogue-db:3306)/socksdb", "Data Source Name: [username[:password]@][protocol[(address)]]/dbname")
 		zip    = flag.String("zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
@@ -66,43 +95,60 @@ func main() {
 	var logger log.Logger
 	{
 		logger = log.NewLogfmtLogger(os.Stderr)
-		logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC)
-		logger = log.NewContext(logger).With("caller", log.DefaultCaller)
+		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+		logger = log.With(logger, "caller", log.DefaultCaller)
 	}
 
 	var tracer stdopentracing.Tracer
 	{
+		// 1. Setup Logger (using modern go-kit/log patterns)
+		var logger log.Logger
+		{
+			logger = log.NewLogfmtLogger(os.Stderr)
+			logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+			logger = log.With(logger, "caller", log.DefaultCaller)
+		}
+
+		// Find service local IP.
+		conn, err := net.Dial("udp", "8.8.8.8:80")
+		if err != nil {
+			logger.Log("err", err)
+			os.Exit(1)
+		}
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		host := strings.Split(localAddr.String(), ":")[0]
+		defer conn.Close()
+
 		if *zip == "" {
 			tracer = stdopentracing.NoopTracer{}
 		} else {
-			// Find service local IP.
-			conn, err := net.Dial("udp", "8.8.8.8:80")
+			// 2. Setup Zipkin Reporter (replaces NewHTTPCollector)
+			// Note: Use /api/v2/spans for modern Zipkin
+			reporter := httpreporter.NewReporter(*zip)
+			defer reporter.Close()
+
+			// 3. Create Local Endpoint
+			endpoint, err := zipkin.NewEndpoint(ServiceName, fmt.Sprintf("%v:%v", host, port))
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
 			}
-			localAddr := conn.LocalAddr().(*net.UDPAddr)
-			host := strings.Split(localAddr.String(), ":")[0]
-			defer conn.Close()
-			logger := log.NewContext(logger).With("tracer", "Zipkin")
-			logger.Log("addr", zip)
-			collector, err := zipkin.NewHTTPCollector(
-				*zip,
-				zipkin.HTTPLogger(logger),
+
+			// 4. Initialize Native Zipkin Tracer
+			nativeTracer, err := zipkin.NewTracer(
+				reporter,
+				zipkin.WithLocalEndpoint(endpoint),
 			)
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
 			}
-			tracer, err = zipkin.NewTracer(
-				zipkin.NewRecorder(collector, false, fmt.Sprintf("%v:%v", host, port), ServiceName),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
+
+			// 5. Wrap for OpenTracing (replaces zipkin.NewRecorder)
+			tracer = zipkinot.Wrap(nativeTracer)
 		}
-		stdopentracing.InitGlobalTracer(tracer)
+
+		stdopentracing.SetGlobalTracer(tracer)
 	}
 
 	// Data domain.
@@ -134,8 +180,11 @@ func main() {
 
 	httpMiddleware := []middleware.Interface{
 		middleware.Instrument{
-			Duration:     HTTPLatency,
-			RouteMatcher: router,
+			Duration:         HTTPLatency,
+			RouteMatcher:     router,
+			InflightRequests: HTTPRequestActive,
+			RequestBodySize:  HTTPRequestSizeBytes,
+			ResponseBodySize: HTTPResponseSizeBytes,
 		},
 	}
 
