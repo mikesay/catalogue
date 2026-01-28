@@ -68,6 +68,9 @@ var (
 
 func init() {
 	prometheus.MustRegister(HTTPLatency)
+	prometheus.MustRegister(HTTPRequestActive)
+	prometheus.MustRegister(HTTPRequestSizeBytes)
+	prometheus.MustRegister(HTTPResponseSizeBytes)
 }
 
 func main() {

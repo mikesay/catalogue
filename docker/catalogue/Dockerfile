@@ -4,7 +4,7 @@ WORKDIR /src
 
 COPY . /src/
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o /app .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o /app /src/cmd/cataloguesvc
 
 FROM alpine:3.23.2
 
