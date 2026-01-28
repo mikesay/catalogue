@@ -1,13 +1,12 @@
-FROM golang:1.7
+FROM golang:1.24.12
 
-COPY . /go/src/github.com/microservices-demo/catalogue
-WORKDIR /go/src/github.com/microservices-demo/catalogue
+WORKDIR /src
 
-RUN go get -u github.com/FiloSottile/gvt
-RUN gvt restore && \
-    CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app github.com/microservices-demo/catalogue/cmd/cataloguesvc
+COPY . /src/
 
-FROM alpine:3.4
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o /app .
+
+FROM alpine:3.23.2
 
 ENV	SERVICE_USER=myuser \
 	SERVICE_UID=10001 \
